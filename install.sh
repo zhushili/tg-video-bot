@@ -45,11 +45,12 @@ detect_admin() {
   python3 - "$token" <<'PY' || true
 import json, sys, time, urllib.request
 base = f'https://api.telegram.org/bot{sys.argv[1]}/'
-tty = open('/dev/tty', 'r+')
+# 终端不能 seek，不能用 'r+' 打开，读写分开
+tty_in, tty_out = open('/dev/tty'), open('/dev/tty', 'w')
 
 def say(s, end='\n'):
-    tty.write(s + end)
-    tty.flush()
+    tty_out.write(s + end)
+    tty_out.flush()
 
 def api(method, http_timeout=40, **params):
     req = urllib.request.Request(base + method, json.dumps(params).encode(), {'Content-Type': 'application/json'})
@@ -82,7 +83,7 @@ try:
             if f.get('username'):
                 name += f' (@{f["username"]})'
             say(f'    收到 {name} 的消息，ID：{f["id"]}。设为管理员？[Y/n] ', end='')
-            if tty.readline().strip().lower() in ('', 'y', 'yes'):
+            if tty_in.readline().strip().lower() in ('', 'y', 'yes'):
                 api('getUpdates', offset=offset, timeout=0)  # 标记已读，机器人启动后不会重复处理
                 try:
                     api('sendMessage', chat_id=f['id'], text='✅ 你已被设为管理员，直接发视频链接就能下载。')
