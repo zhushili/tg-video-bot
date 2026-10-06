@@ -13,18 +13,17 @@ bash <(curl -fsSL https://raw.githubusercontent.com/zhushili/tg-video-bot/main/i
 ```
 
 1. 按提示填入 [@BotFather](https://t.me/BotFather) 给的 Token，API ID 没有就直接回车
-2. 给机器人发 `/id`，把 ID 填到 `/opt/tgdl/.env` 的 `ADMIN_IDS=`，执行 `systemctl restart tgdl`
+2. 按提示用手机给机器人发一条消息，在终端确认后自动设为管理员
 
-再次运行同一命令即升级；命令末尾加 ` uninstall` 即卸载。
+再次运行同一命令即升级；命令末尾加 ` admin` 添加管理员，加 ` uninstall` 卸载。
 
 ## 使用
 
-私聊直接发链接；`/audio 链接` 只下音频；`/dl 链接` 在群组里用；`/cancel` 取消；管理员可用 `/status`、`/update`。
+私聊直接发链接；`/audio 链接` 只下音频；`/dl 链接` 在群组里用；`/cancel` 取消。陌生人给机器人发消息时，管理员会收到「✅ 允许」按钮，点一下即可添加；也可用 `/allow ID`、`/remove ID`、`/users` 管理，`/status`、`/update` 查看状态和更新。
 
 ## 配置
 
 `/opt/tgdl/.env`，修改后 `systemctl restart tgdl`，日志 `journalctl -u tgdl -f`。
 
 - `API_ID` / `API_HASH`：2GB 模式，在 [my.telegram.org](https://my.telegram.org) → API development tools 申请
-- `ALLOWED_USERS`：允许使用的用户 ID（逗号分隔，`*` 为所有人）；`MAX_HEIGHT`：最高分辨率，默认 720
-- `COOKIES_FILE`：YouTube 提示 "not a bot" 时使用，文件放在 `/opt/tgdl/data/` 并 `chown tgdl:tgdl`
+- `MAX_HEIGHT`：最高分辨率，默认 720；`ALLOWED_USERS=*`：允许所有人使用；`COOKIES_FILE`：YouTube 提示 "not a bot" 时使用（放在 `/opt/tgdl/data/` 并 `chown tgdl:tgdl`）

@@ -29,6 +29,72 @@ set_env() {
   local key="$1" val="${2//[$'\t\r\n ']/}"
   sed -i "s|^${key}=.*|${key}=${val}|" "$ENV_FILE"
 }
+add_env_id() {
+  local key="$1" id="$2" cur
+  cur=$(grep -E "^${key}=" "$ENV_FILE" | head -1 | cut -d= -f2- || true)
+  case ",$cur," in *",$id,"*) return 0 ;; esac
+  if grep -qE "^${key}=" "$ENV_FILE"; then set_env "$key" "${cur:+$cur,}$id"; else echo "${key}=$id" >> "$ENV_FILE"; fi
+}
+
+# 让主人用手机给机器人发一条消息，自动识别 ID（不用自己去查），识别到后在终端确认
+detect_admin() {
+  local token
+  token=$(grep -E '^BOT_TOKEN=' "$ENV_FILE" | head -1 | cut -d= -f2- || true)
+  [ -n "$token" ] && has_tty || return 0
+  systemctl stop "$SERVICE" 2>/dev/null || true  # 机器人在运行的话会抢走消息
+  python3 - "$token" <<'PY' || true
+import json, sys, time, urllib.request
+base = f'https://api.telegram.org/bot{sys.argv[1]}/'
+tty = open('/dev/tty', 'r+')
+
+def say(s, end='\n'):
+    tty.write(s + end)
+    tty.flush()
+
+def api(method, http_timeout=40, **params):
+    req = urllib.request.Request(base + method, json.dumps(params).encode(), {'Content-Type': 'application/json'})
+    with urllib.request.urlopen(req, timeout=http_timeout) as r:
+        return json.load(r)['result']
+
+try:
+    me = api('getMe')
+    api('deleteWebhook')
+except Exception as e:
+    say(f'[!] 连接 Telegram 失败（{e}），跳过。之后给机器人发 /id 查看 ID')
+    sys.exit(0)
+say(f'\n\033[32m==>\033[0m 设置管理员：用手机打开 https://t.me/{me["username"]} 点「开始」或发任意消息')
+say('    正在等待（最多 3 分钟，按 Ctrl+C 跳过）…')
+offset, deadline = 0, time.time() + 180
+try:
+    while time.time() < deadline:
+        try:
+            updates = api('getUpdates', offset=offset, timeout=25, allowed_updates=['message'])
+        except Exception:
+            time.sleep(3)
+            continue
+        for u in updates:
+            offset = u['update_id'] + 1
+            m = u.get('message') or {}
+            f = m.get('from')
+            if not f or (m.get('chat') or {}).get('type') != 'private':
+                continue
+            name = ' '.join(x for x in (f.get('first_name'), f.get('last_name')) if x)
+            if f.get('username'):
+                name += f' (@{f["username"]})'
+            say(f'    收到 {name} 的消息，ID：{f["id"]}。设为管理员？[Y/n] ', end='')
+            if tty.readline().strip().lower() in ('', 'y', 'yes'):
+                api('getUpdates', offset=offset, timeout=0)  # 标记已读，机器人启动后不会重复处理
+                try:
+                    api('sendMessage', chat_id=f['id'], text='✅ 你已被设为管理员，直接发视频链接就能下载。')
+                except Exception:
+                    pass
+                print(f['id'])
+                sys.exit(0)
+    say('[!] 3 分钟内没收到消息，跳过。之后可以重新运行安装命令并在末尾加 admin')
+except KeyboardInterrupt:
+    say('\n    已跳过')
+PY
+}
 
 [ "$(id -u)" -eq 0 ] || die "请用 root 运行（先执行 sudo -i）"
 
@@ -40,6 +106,20 @@ if [ "${1:-}" = "uninstall" ]; then
   rm -rf "$APP_DIR"
   if id tgdl &>/dev/null; then userdel tgdl; fi
   info "已卸载（/swapfile 保留，不需要可以 swapoff /swapfile 后删除并去掉 /etc/fstab 里那一行）"
+  exit 0
+fi
+
+# ---------------------------------------------------------------- 添加管理员
+if [ "${1:-}" = "admin" ]; then
+  [ -f "$ENV_FILE" ] || die "还没有安装，先运行一键安装命令（末尾不加 admin）"
+  has_tty || die "需要在交互式终端里运行"
+  new_id=$(detect_admin)
+  if [ -n "$new_id" ]; then
+    add_env_id ADMIN_IDS "$new_id"
+    chown tgdl:tgdl "$ENV_FILE" && chmod 600 "$ENV_FILE"
+  fi
+  systemctl restart "$SERVICE"
+  if [ -n "$new_id" ]; then info "已把 $new_id 设为管理员，机器人已重启 ✅"; fi
   exit 0
 fi
 
@@ -146,7 +226,10 @@ if [ "$NEW_ENV" = 1 ] && has_tty; then
     set_env API_ID "$v"
     [ -z "$v" ] || set_env API_HASH "$(ask 'API_HASH: ')"
   fi
-  [ -n "${ADMIN_IDS:-}" ] || set_env ADMIN_IDS "$(ask '你的 Telegram 用户 ID（不知道就直接回车，装好后给机器人发 /id）: ')"
+fi
+if ! grep -qE '^ADMIN_IDS=[0-9-]' "$ENV_FILE"; then
+  new_id=$(detect_admin)
+  [ -z "$new_id" ] || add_env_id ADMIN_IDS "$new_id"
 fi
 chown -R tgdl:tgdl "$APP_DIR"
 chmod 600 "$ENV_FILE"
@@ -225,11 +308,11 @@ else
 fi
 
 info "安装目录占用 $(du -sh "$APP_DIR" | cut -f1)，磁盘剩余 $(free_mb /) MB"
-if ! grep -qE '^(ADMIN_IDS|ALLOWED_USERS)=.+' "$ENV_FILE"; then
+if ! grep -qE '^ADMIN_IDS=[0-9-]' "$ENV_FILE"; then
   cat <<EOF
 
-还差一步：给机器人发 /id 拿到你的用户 ID，填到 $ENV_FILE 的 ADMIN_IDS=，
-然后执行 systemctl restart $SERVICE
+还没有管理员，运行下面的命令并按提示给机器人发一条消息即可：
+  bash <(curl -fsSL https://raw.githubusercontent.com/$REPO/$BRANCH/install.sh) admin
 EOF
 fi
 echo "日志：journalctl -u $SERVICE -f    配置：$ENV_FILE"

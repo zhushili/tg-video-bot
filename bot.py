@@ -54,7 +54,29 @@ def env_int(name, default):
 
 
 def parse_ids(raw):
-    return {int(x) for x in re.split(r'[,\s]+', raw or '') if x.strip().lstrip('-').isdigit()}
+    return {int(x) for x in re.split(r'[,\s，]+', raw or '') if x.strip().lstrip('-').isdigit()}
+
+
+def save_ids(key, ids):
+    """把用户 ID 列表写回 .env，重启后依然有效。"""
+    path = BASE / '.env'
+    value = ','.join(str(i) for i in sorted(ids))
+    lines = path.read_text(encoding='utf-8').splitlines() if path.is_file() else []
+    for i, line in enumerate(lines):
+        if line.startswith(f'{key}='):
+            lines[i] = f'{key}={value}'
+            break
+    else:
+        lines.append(f'{key}={value}')
+    tmp = path.with_name('.env.tmp')
+    tmp.write_text('\n'.join(lines) + '\n', encoding='utf-8')
+    os.chmod(tmp, 0o600)
+    tmp.replace(path)
+
+
+def display_name(first, last, username):
+    name = ' '.join(x for x in (first, last) if x) or '无名氏'
+    return f'{name} (@{username})' if username else name
 
 
 BOT_TOKEN = os.environ.get('BOT_TOKEN', '').strip()
@@ -123,19 +145,21 @@ class Incoming:
     text: str
     links: list = field(default_factory=list)  # 文字里隐藏的超链接
     reply_text: str = ''  # 被回复的那条消息的文字
-
-
-@dataclass
-class Callback:
-    sender_id: int
-    data: str
-    raw: object
+    sender_name: str = ''
 
 
 @dataclass
 class MsgRef:
     chat: object
     msg_id: int
+
+
+@dataclass
+class Callback:
+    sender_id: int
+    data: str
+    msg: MsgRef  # 按钮所在的消息
+    raw: object
 
 
 class BotApiError(Exception):
@@ -231,6 +255,7 @@ class BotApiBackend:
             text=m.get('text') or m.get('caption') or '',
             links=[e['url'] for e in entities if e.get('type') == 'text_link' and e.get('url')],
             reply_text=reply.get('text') or reply.get('caption') or '',
+            sender_name=display_name(sender.get('first_name'), sender.get('last_name'), sender.get('username')),
         )
 
     async def run(self, on_message, on_callback):
@@ -259,7 +284,9 @@ class BotApiBackend:
                         self._spawn(on_message(inc))
                 elif 'callback_query' in u:
                     q = u['callback_query']
-                    self._spawn(on_callback(Callback(q['from']['id'], q.get('data') or '', q)))
+                    m = q.get('message') or {}
+                    ref = MsgRef((m.get('chat') or {}).get('id'), m.get('message_id'))
+                    self._spawn(on_callback(Callback(q['from']['id'], q.get('data') or '', ref, q)))
 
     async def send_text(self, chat, text, reply_to=None, buttons=None):
         m = await self.call('sendMessage', {
@@ -356,6 +383,7 @@ class TelethonBackend:
             if event.is_reply and text.startswith('/'):
                 r = await event.get_reply_message()
                 reply_text = (r.raw_text or '') if r else ''
+            sender = await event.get_sender()
             await on_message(Incoming(
                 chat=await event.get_input_chat(),
                 msg_id=event.id,
@@ -365,10 +393,15 @@ class TelethonBackend:
                 links=[e.url for e in (event.message.entities or [])
                        if isinstance(e, types.MessageEntityTextUrl)],
                 reply_text=reply_text,
+                sender_name=display_name(
+                    getattr(sender, 'first_name', None), getattr(sender, 'last_name', None),
+                    getattr(sender, 'username', None),
+                ),
             ))
 
         async def cb_handler(event):
-            await on_callback(Callback(event.sender_id, event.data.decode(errors='ignore'), event))
+            ref = MsgRef(await event.get_input_chat(), event.message_id)
+            await on_callback(Callback(event.sender_id, event.data.decode(errors='ignore'), ref, event))
 
         self.client.add_event_handler(msg_handler, self.events.NewMessage(incoming=True))
         self.client.add_event_handler(cb_handler, self.events.CallbackQuery())
@@ -791,8 +824,69 @@ def help_text(uid):
         '/id — 查看你的用户 ID\n'
     )
     if is_admin(uid):
-        text += '\n管理员：/status 运行状态 · /update 更新 yt-dlp'
+        text += (
+            '\n<b>管理员</b>\n'
+            '/allow ID — 允许用户使用（陌生人发消息时也会收到一键允许的按钮）\n'
+            '/remove ID — 移除用户 · /users — 用户列表\n'
+            '/status — 运行状态 · /update — 更新 yt-dlp'
+        )
     return text
+
+
+INSTALL_CMD = 'bash &lt;(curl -fsSL https://raw.githubusercontent.com/zhushili/tg-video-bot/main/install.sh) admin'
+access_requests = {}  # uid -> 上次通知管理员的时间，防止刷屏
+
+
+async def request_access(inc):
+    """陌生人发消息：告诉他 ID，并给管理员发一条带「允许」按钮的通知。"""
+    uid = inc.sender_id
+
+    async def reply(t):
+        await backend.send_text(inc.chat, t, reply_to=inc.msg_id)
+
+    if not ADMIN_IDS:
+        await reply(
+            f'⛔ 你没有使用权限。你的用户 ID：<code>{uid}</code>\n\n'
+            f'如果你是机器人的主人，在 VPS 上运行下面的命令，按提示操作即可成为管理员：\n<code>{INSTALL_CMD}</code>'
+        )
+        return
+    now = time.monotonic()
+    if now - access_requests.get(uid, -1e9) < 3600:
+        await reply('⛔ 已经通知过管理员了，批准后会告诉你。')
+        return
+    access_requests[uid] = now
+    await reply(f'⛔ 你还没有使用权限（ID：<code>{uid}</code>），已通知管理员，批准后会告诉你。')
+    for admin in ADMIN_IDS:
+        try:
+            await backend.send_text(
+                admin,
+                f'👤 <b>{html.escape(inc.sender_name)}</b>（ID <code>{uid}</code>）请求使用机器人',
+                buttons=[('✅ 允许', f'a:{uid}'), ('🚫 忽略', f'x:{uid}')],
+            )
+        except Exception as e:  # noqa: BLE001
+            log.warning('通知管理员 %s 失败：%s', admin, e)
+
+
+async def manage_users(cmd, arg, reply):
+    if ALLOW_ALL:
+        await reply('当前 ALLOWED_USERS=*，所有人都能使用，不需要单独添加。')
+        return
+    if cmd == 'users':
+        admins = ', '.join(f'<code>{i}</code>' for i in sorted(ADMIN_IDS)) or '（无）'
+        users = ', '.join(f'<code>{i}</code>' for i in sorted(ALLOWED_USERS)) or '（无）'
+        await reply(f'管理员：{admins}\n允许的用户：{users}')
+        return
+    ids = parse_ids(arg)
+    if not ids:
+        await reply(f'用法：/{cmd} 用户ID（多个用空格或逗号隔开）')
+        return
+    if cmd == 'allow':
+        ALLOWED_USERS.update(ids)
+    else:
+        ALLOWED_USERS.difference_update(ids)
+    save_ids('ALLOWED_USERS', ALLOWED_USERS)
+    action = '已允许' if cmd == 'allow' else '已移除'
+    await reply(f'✅ {action}：' + ', '.join(f'<code>{i}</code>' for i in sorted(ids)))
 
 
 def clean_urls(urls):
@@ -862,21 +956,21 @@ async def on_message(inc):
         if target and target.lower() != bot_username.lower():
             return  # 群里发给别的机器人的命令
 
-    if cmd in ('start', 'help', 'id'):
-        if cmd == 'id' or not is_allowed(uid):
-            note = '' if is_allowed(uid) else '\n\n⛔ 你还没有使用权限，请把上面的 ID 发给管理员。'
-            await reply(f'你的用户 ID：<code>{uid}</code>{note}')
-        else:
-            await reply(help_text(uid))
-        return
-
     if cmd is None and not inc.is_private:
         return  # 群里只响应命令
     if not is_allowed(uid):
         if inc.is_private:
-            await reply(f'⛔ 你没有使用权限。你的用户 ID：<code>{uid}</code>')
+            await request_access(inc)
+        elif cmd in ('start', 'help', 'id'):
+            await reply(f'你的用户 ID：<code>{uid}</code>（没有使用权限，请私聊机器人申请）')
         return
 
+    if cmd in ('start', 'help', 'id'):
+        await reply(f'你的用户 ID：<code>{uid}</code>' if cmd == 'id' else help_text(uid))
+        return
+    if cmd in ('allow', 'remove', 'users') and is_admin(uid):
+        await manage_users(cmd, arg, reply)
+        return
     if cmd == 'status' and is_admin(uid):
         await cmd_status(reply)
         return
@@ -910,9 +1004,13 @@ async def on_message(inc):
 
 
 async def on_callback(cb):
-    if not cb.data.startswith('c:'):
+    kind, _, arg = cb.data.partition(':')
+    if kind in ('a', 'x'):
+        await on_access_button(cb, kind, arg)
         return
-    job = jobs.get(cb.data[2:])
+    if kind != 'c':
+        return
+    job = jobs.get(arg)
     if not job:
         await backend.answer_callback(cb, '任务已经结束了')
         return
@@ -921,6 +1019,30 @@ async def on_callback(cb):
         return
     job.task.cancel()
     await backend.answer_callback(cb, '已取消')
+
+
+async def on_access_button(cb, kind, arg):
+    """管理员点了通知里的「允许」/「忽略」。"""
+    if not is_admin(cb.sender_id):
+        await backend.answer_callback(cb, '只有管理员可以操作', alert=True)
+        return
+    if not arg.lstrip('-').isdigit():
+        return
+    uid = int(arg)
+    if kind == 'x':
+        await backend.answer_callback(cb, '已忽略')
+        await safe_edit(cb.msg, f'🚫 已忽略用户 <code>{uid}</code>')
+        return
+    if not ALLOW_ALL:
+        ALLOWED_USERS.add(uid)
+        save_ids('ALLOWED_USERS', ALLOWED_USERS)
+    access_requests.pop(uid, None)
+    await backend.answer_callback(cb, '已允许')
+    await safe_edit(cb.msg, f'✅ 已允许用户 <code>{uid}</code>（发 /remove {uid} 可撤销）')
+    try:
+        await backend.send_text(uid, '✅ 管理员已批准，现在直接发视频链接就能下载了。发 /help 查看用法。')
+    except Exception as e:  # noqa: BLE001
+        log.warning('通知用户 %s 失败：%s', uid, e)
 
 
 # ================================================================ 启动
